@@ -31,7 +31,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     Mamba2AttnBackend,
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
-from sglang.srt.layers.communicator import complete_deferred_allreduce
+from sglang.srt.layers.communicator import UnreducedOutput, reduce_output
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     is_dp_attention_enabled,
@@ -427,7 +427,7 @@ class NemotronHMLPLikeDecoderLayer(nn.Module):
         ):
             hidden_states = self.mixer.forward(hidden_states)
         if fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
+            hidden_states = UnreducedOutput(hidden_states)
         else:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
@@ -531,7 +531,7 @@ class NemotronHAttnLikeDecoderLayer(nn.Module):
                 hidden_states, forward_batch, skip_reduce
             )
         if fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
+            hidden_states = UnreducedOutput(hidden_states)
         return hidden_states, residual
 
 
@@ -808,7 +808,7 @@ class NemotronHModel(nn.Module):
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
-                hidden_states = complete_deferred_allreduce(hidden_states)
+                hidden_states = reduce_output(hidden_states)
                 aux_hidden_states.append(
                     self._capture_hidden_states(hidden_states, residual, i)
                 )

@@ -10,7 +10,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from sglang.srt.layers.communicator import LayerCommunicator
+from sglang.srt.layers.communicator import LayerCommunicator, UnreducedOutput
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -21,7 +21,6 @@ HIDDEN = 4
 TOKENS = 3
 NUM_LAYERS = 4
 CAPTURED = [1, 2, 3]
-MARKER = "_sglang_needs_allreduce_fusion"
 
 
 def all_reduce(hidden_states):
@@ -42,14 +41,12 @@ class DeferringLayer(nn.Module):
     def forward(
         self, positions=None, hidden_states=None, forward_batch=None, residual=None, **_
     ):
-        if getattr(hidden_states, MARKER, False):
-            hidden_states = all_reduce(hidden_states)
+        if isinstance(hidden_states, UnreducedOutput):
+            hidden_states = all_reduce(hidden_states.partial)
         residual = hidden_states if residual is None else hidden_states + residual
         if self.is_last_layer:
             return torch.ones_like(residual), residual
-        partial = torch.full_like(residual, 1 / TP_SIZE)
-        setattr(partial, MARKER, True)
-        return partial, residual
+        return UnreducedOutput(torch.full_like(residual, 1 / TP_SIZE)), residual
 
 
 class SumNorm(nn.Module):
