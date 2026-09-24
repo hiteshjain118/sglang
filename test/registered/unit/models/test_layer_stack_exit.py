@@ -1,9 +1,9 @@
 """A decoder layer may leave its FFN all-reduce to the next layer's input norm.
 The last layer on a rank has no next layer there, so a model built from such
 layers must pass their output through ``finish_layer_stack`` before the final
-norm or the send to the next pipeline rank. Between layers, an in-place write to
-a layer's output needs the completed sum as well. Every set below is derived
-from the model sources."""
+norm or the send to the next pipeline rank. Between layers, anything but handing
+a layer's output to the next layer needs the completed sum as well. Every set
+below is derived from the model sources."""
 
 import ast
 import unittest
@@ -20,7 +20,6 @@ MARKER = "_sglang_needs_allreduce_fusion"
 EXIT = "finish_layer_stack"
 COMPLETE = "complete_deferred_allreduce"
 FINAL_NORMS = {"norm", "norm_f", "final_layernorm"}
-IN_PLACE = {"add_", "sub_", "mul_", "copy_"}
 
 
 def base_names(node):
@@ -254,6 +253,33 @@ def inside_loop(tree, target):
     return False
 
 
+def reads_between_layers(loop):
+    """Lines in ``loop`` that use ``hidden_states`` other than by handing it to a
+    call whose result becomes ``hidden_states`` again (a layer, or the
+    reduction itself). Loops that run no such call are not layer loops."""
+    handed = set()
+    for node in ast.walk(loop):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+            targets = {
+                name.id
+                for target in node.targets
+                for name in ast.walk(target)
+                if isinstance(name, ast.Name)
+            }
+            if "hidden_states" in targets:
+                handed |= {id(sub) for sub in ast.walk(node.value)}
+    if not handed:
+        return set()
+    return {
+        node.lineno
+        for node in ast.walk(loop)
+        if isinstance(node, ast.Name)
+        and node.id == "hidden_states"
+        and isinstance(node.ctx, ast.Load)
+        and id(node) not in handed
+    }
+
+
 def is_final_norm(call):
     func, chain = call.func, []
     while isinstance(func, ast.Attribute):
@@ -303,22 +329,20 @@ class TestLayerStackExit(CustomTestCase):
                     )
         self.assertEqual(problems, [])
 
-    def test_in_place_writes_between_layers_see_the_reduced_sum(self):
-        problems = []
+    def test_values_read_between_layers_see_the_reduced_sum(self):
+        problems = set()
         for name, (forward, _) in sorted(self.subjects.items()):
-            completes = [call.lineno for call in calls(forward, COMPLETE)]
-            for call in ast.walk(forward):
-                if (
-                    isinstance(call, ast.Call)
-                    and isinstance(call.func, ast.Attribute)
-                    and call.func.attr in IN_PLACE
-                    and isinstance(call.func.value, ast.Name)
-                    and call.func.value.id == "hidden_states"
-                    and not any(line < call.lineno for line in completes)
-                ):
-                    problems.append(f"{name} line {call.lineno}")
+            for loop in ast.walk(forward):
+                if not isinstance(loop, (ast.For, ast.While)):
+                    continue
+                completes = [call.lineno for call in calls(loop, COMPLETE)]
+                for line in reads_between_layers(loop):
+                    if not any(done < line for done in completes):
+                        problems.add(f"{name} line {line}")
         self.assertEqual(
-            problems, [], f"call {COMPLETE}(hidden_states) before writing in place"
+            sorted(problems),
+            [],
+            f"call {COMPLETE}(hidden_states) before reading it between layers",
         )
 
 

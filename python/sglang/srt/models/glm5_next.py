@@ -28,6 +28,7 @@ from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
+    complete_deferred_allreduce,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
@@ -1181,6 +1182,7 @@ class Glm5NextModel(nn.Module):
             )
             with ctx:
                 if i in self.layers_to_capture:
+                    hidden_states = complete_deferred_allreduce(hidden_states)
                     aux_hidden_state = self._prepare_aux_hidden_state(
                         hidden_states, residual
                     )

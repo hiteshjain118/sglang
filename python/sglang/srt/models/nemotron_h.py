@@ -25,15 +25,13 @@ from torch import nn
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs import NemotronHConfig
 from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MLP, MOE
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_reduce,
-)
 from sglang.srt.layers.activation import ReLU2
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     Mamba2AttnBackend,
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
+from sglang.srt.layers.communicator import complete_deferred_allreduce
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     is_dp_attention_enabled,
@@ -810,11 +808,7 @@ class NemotronHModel(nn.Module):
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
-                if residual is not None and getattr(
-                    hidden_states, "_sglang_needs_allreduce_fusion", False
-                ):
-                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-                    hidden_states._sglang_needs_allreduce_fusion = False
+                hidden_states = complete_deferred_allreduce(hidden_states)
                 aux_hidden_states.append(
                     self._capture_hidden_states(hidden_states, residual, i)
                 )

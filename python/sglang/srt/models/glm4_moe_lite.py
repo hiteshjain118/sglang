@@ -35,6 +35,7 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
+    complete_deferred_allreduce,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
@@ -803,6 +804,7 @@ class Glm4MoeLiteModel(nn.Module):
         for i in range(normal_start_layer, normal_end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 if i in self.layers_to_capture:
+                    hidden_states = complete_deferred_allreduce(hidden_states)
                     aux_hidden_states.append(hidden_states + residual)
                 layer = self.layers[i]
                 hidden_states, residual = layer(
