@@ -1962,6 +1962,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 and layer_idx < 3
             ):
                 sep = self.hidden_size * layer_idx
+                hidden_states = complete_deferred_allreduce(hidden_states)
                 hidden_states.add_(
                     input_deepstack_embeds[:, sep : sep + self.hidden_size]
                 )
