@@ -1,9 +1,13 @@
+import ast
+import re
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import torch
 
+import sglang
 from sglang.srt.layers import communicator as comm
 from sglang.srt.layers.communicator import (
     CommunicateSummableTensorPairFn,
@@ -19,7 +23,12 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def make_communicator(
-    *, fuse, reduce_scatter, next_layer_reduce_scatter=None, cls=LayerCommunicator
+    *,
+    fuse,
+    reduce_scatter,
+    next_layer_reduce_scatter=None,
+    next_layer_scatter=None,
+    cls=LayerCommunicator,
 ):
     """A communicator whose decisions and postprocess are stubbed, built
     without the process-wide parallel state."""
@@ -30,6 +39,7 @@ def make_communicator(
     communicator._reduce_scatter_for_next_layer = MagicMock(
         return_value=next_layer_reduce_scatter
     )
+    communicator._scatter_for_next_layer = MagicMock(return_value=next_layer_scatter)
     communicator.postprocess_layer = MagicMock(
         side_effect=lambda hidden_states, residual, forward_batch: (
             hidden_states + 1,
@@ -78,6 +88,17 @@ class TestFfnExit(CustomTestCase):
         self.assertIs(residual, self.residual)
         communicator.postprocess_layer.assert_not_called()
         step.assert_not_called()
+
+    def test_a_deferred_sum_carries_the_scatter_back_under_attention_dp(self):
+        step = MagicMock()
+        communicator = make_communicator(
+            fuse=True, reduce_scatter=False, next_layer_scatter=step
+        )
+        _, (hidden_states, _) = self.run_exit(communicator)
+        self.assertIsInstance(hidden_states, UnreducedOutput)
+        self.assertIs(hidden_states.reduce_and_redistribute, step)
+        communicator._reduce_scatter_for_next_layer.assert_not_called()
+        communicator.postprocess_layer.assert_not_called()
 
     def test_postprocess_completes_other_exits(self):
         for reduce_scatter in (False, True):
@@ -240,6 +261,130 @@ class TestReduceScatterForNextLayer(CustomTestCase):
             self.assertIsNone(
                 self.bound(communicator, comm._reduce_and_redistribute_output_varlen)
             )
+
+
+class TestScatterForNextLayer(CustomTestCase):
+    def communicator(self, pair_fn):
+        communicator = LayerCommunicator.__new__(LayerCommunicator)
+        communicator._communicate_summable_tensor_pair_fn = pair_fn
+        return communicator
+
+    def test_only_a_scatter_back_to_local_tokens_is_carried(self):
+        forward_batch = object()
+        bound = self.communicator(
+            CommunicateSummableTensorPairFn._scatter_hidden_states
+        )._scatter_for_next_layer(forward_batch)
+        self.assertIs(bound.func, comm._all_reduce_then_to_local_tokens)
+        self.assertIs(bound.args[0], forward_batch)
+        self.assertIsNone(
+            self.communicator(
+                CommunicateSummableTensorPairFn._trivial
+            )._scatter_for_next_layer(forward_batch)
+        )
+
+    def test_the_all_reduce_runs_before_the_scatter(self):
+        calls = []
+        partial = torch.ones(3, 4)
+        local = torch.empty(1, 4)
+        with (
+            patch.object(
+                comm,
+                "deferred_post_experts_all_reduce",
+                side_effect=lambda x: calls.append(("all_reduce", x)) or x * 2,
+            ),
+            patch.object(comm, "_dp_scatter_group", return_value="group"),
+            patch.object(
+                comm,
+                "get_local_dp_buffer",
+                side_effect=lambda group: calls.append(("buffer", group)) or local,
+            ),
+            patch.object(
+                comm,
+                "dp_scatter",
+                side_effect=lambda out, full, fb: calls.append(("scatter", out)),
+            ),
+        ):
+            result = comm._all_reduce_then_to_local_tokens(object(), partial)
+        self.assertEqual([c[0] for c in calls], ["all_reduce", "buffer", "scatter"])
+        self.assertIs(calls[0][1], partial)
+        self.assertIs(result, local)
+
+
+MODELS_DIR = Path(sglang.__file__).resolve().parent / "srt" / "models"
+
+
+def model_module_imports(source):
+    return set(re.findall(r"from sglang\.srt\.models\.([\w.]+) import", source))
+
+
+def attention_tp_reductions(tree):
+    """Lines that can turn on use_dp_attention_reduce: a keyword argument or an
+    attribute write, other than False or a function forwarding its own
+    parameter of that name."""
+
+    def can_be_true(value, params):
+        if isinstance(value, ast.Constant) and value.value is False:
+            return False
+        return not (isinstance(value, ast.Name) and value.id in params)
+
+    found = set()
+    scopes = [(tree, set())] + [
+        (fn, {a.arg for a in fn.args.args + fn.args.kwonlyargs})
+        for fn in ast.walk(tree)
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    for scope, params in scopes:
+        for node in ast.walk(scope):
+            if isinstance(node, ast.keyword) and node.arg == "use_dp_attention_reduce":
+                if can_be_true(node.value, params):
+                    found.add(node.value.lineno)
+            elif isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Attribute) and t.attr == "use_dp_attention_reduce"
+                for t in node.targets
+            ):
+                if can_be_true(node.value, params):
+                    found.add(node.lineno)
+    # A forwarded parameter is also seen from the module scope; keep a line only
+    # if no enclosing function forwards it.
+    forwarded = {
+        node.value.lineno
+        for fn, params in scopes[1:]
+        for node in ast.walk(fn)
+        if isinstance(node, ast.keyword)
+        and node.arg == "use_dp_attention_reduce"
+        and not can_be_true(node.value, params)
+    }
+    return sorted(found - forwarded)
+
+
+class TestFfnExitUsersOweATpSum(CustomTestCase):
+    """Under attention DP the next layer's input completes a deferred FFN sum
+    with an all-reduce over TP. An FFN whose linear layer reduces over the
+    attention-TP group only (use_dp_attention_reduce) owes a different sum, so
+    no model that uses ffn_exit may build one."""
+
+    def test_no_ffn_exit_user_reduces_over_attention_tp(self):
+        sources = {
+            str(p.relative_to(MODELS_DIR))[:-3].replace("/", "."): p.read_text()
+            for p in MODELS_DIR.rglob("*.py")
+        }
+        users = sorted(name for name, src in sources.items() if ".ffn_exit(" in src)
+        self.assertTrue(users, "no model uses ffn_exit")
+        offenders = []
+        for user in users:
+            seen, todo = set(), [user]
+            while todo:
+                name = todo.pop()
+                if name in seen or name not in sources:
+                    continue
+                seen.add(name)
+                todo.extend(model_module_imports(sources[name]))
+            offenders += [
+                f"{user} -> {name}:{line}"
+                for name in sorted(seen)
+                for line in attention_tp_reductions(ast.parse(sources[name]))
+            ]
+        self.assertEqual(offenders, [])
 
 
 if __name__ == "__main__":
